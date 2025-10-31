@@ -112,7 +112,7 @@ class MariaDB(VectorDB):
 
         self.insert_sql = f"INSERT INTO {self.db_name}.{self.table_name} (id, v) VALUES (%s, %s)"  # noqa: S608
         self.select_sql = (
-            f"SELECT id FROM {self.db_name}.{self.table_name}"  # noqa: S608
+            f"SELECT id FROM {self.db_name}.{self.table_name} "  # noqa: S608
             f"ORDER by vec_distance_{search_param['metric_type']}(v, %s) LIMIT %d"
         )
         self.select_sql_with_filter = (
@@ -131,7 +131,7 @@ class MariaDB(VectorDB):
     def ready_to_load(self) -> bool:
         pass
 
-    def optimize(self) -> None:
+    def optimize(self, data_size: int) -> None:
         assert self.conn is not None, "Connection is not initialized"
         assert self.cursor is not None, "Cursor is not initialized"
 
