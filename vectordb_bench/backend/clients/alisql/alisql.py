@@ -79,8 +79,9 @@ class AliSQL(VectorDB):
                 f"""
               CREATE TABLE {self.table_name} (
                 id INT PRIMARY KEY,
-                v VECTOR({self.dim}) NOT NULL
-              )
+                v VECTOR({self.dim}) NOT NULL,
+                VECTOR INDEX (v)
+              ) engine = innodb;
             """
             )
             self.cursor.execute("COMMIT")
@@ -110,15 +111,15 @@ class AliSQL(VectorDB):
             self.cursor.execute("COMMIT")
 
         self.insert_sql = (
-            f'INSERT INTO {self.db_config["database"]}.{self.table_name} (id, v) VALUES (%s, %s)'  # noqa: S608
+            f'INSERT INTO {self.db_config["database"]}.{self.table_name} (id, v) VALUES (%s, TO_VECTOR(%s))'  # noqa: S608
         )
         self.select_sql = (
             f'SELECT id FROM {self.db_config["database"]}.{self.table_name} '  # noqa: S608
-            f"ORDER by vec_distance_{search_param['metric_type']}(v, %s) LIMIT %s"
+            f"ORDER by {search_param['metric_type']}_DISTANCE(v, TO_VECTOR(%s)) LIMIT %s"
         )
         self.select_sql_with_filter = (
             f'SELECT id FROM {self.db_config["database"]}.{self.table_name} WHERE id >= %s '  # noqa: S608
-            f"ORDER by vec_distance_{search_param['metric_type']}(v, %s) LIMIT %s"
+            f"ORDER by {search_param['metric_type']}_DISTANCE(v, TO_VECTOR(%s)) LIMIT %s"
         )
 
         try:
@@ -133,31 +134,12 @@ class AliSQL(VectorDB):
         pass
 
     def optimize(self, data_size: int) -> None:
-        assert self.conn is not None, "Connection is not initialized"
-        assert self.cursor is not None, "Cursor is not initialized"
-
-        index_param = self.case_config.index_param()
-
-        try:
-            index_options = f"DISTANCE={index_param['metric_type']}"
-            if index_param["index_type"] == "HNSW" and index_param["M"] is not None:
-                index_options += f" M={index_param['M']}"
-
-            self.cursor.execute(
-                f"""
-              ALTER TABLE {self.db_config["database"]}.{self.table_name}
-              ADD VECTOR KEY v(v) {index_options}
-            """
-            )
-            self.cursor.execute("COMMIT")
-
-        except Exception as e:
-            log.warning(f"Failed to create index: {self.table_name} error: {e}")
-            raise e from None
+        log.info('do nothing at optimize stage')
 
     @staticmethod
-    def vector_to_hex(v):  # noqa: ANN001
-        return np.array(v, "float32").tobytes()
+    def vector_to_string(v):  # noqa: ANN001
+        """Convert vector to string format for TO_VECTOR function."""
+        return "[" + ",".join(str(x) for x in v) + "]"
 
     def insert_embeddings(
         self,
@@ -177,7 +159,7 @@ class AliSQL(VectorDB):
 
             batch_data = []
             for i, row in enumerate(metadata_arr):
-                batch_data.append((int(row), self.vector_to_hex(embeddings_arr[i])))
+                batch_data.append((int(row), self.vector_to_string(embeddings_arr[i])))
 
             self.cursor.executemany(self.insert_sql, batch_data)
             self.cursor.execute("COMMIT")
@@ -202,10 +184,11 @@ class AliSQL(VectorDB):
         search_param = self.case_config.search_param()  # noqa: F841
 
         try:
+            query_str = self.vector_to_string(query)
             if filters:
-                self.cursor.execute(self.select_sql_with_filter, (filters.get("id"), self.vector_to_hex(query), k))
+                self.cursor.execute(self.select_sql_with_filter, (filters.get("id"), query_str, k))
             else:
-                self.cursor.execute(self.select_sql, (self.vector_to_hex(query), k))
+                self.cursor.execute(self.select_sql, (query_str, k))
             return [row[0] for row in self.cursor.fetchall()]
 
         except mysql.Error:
