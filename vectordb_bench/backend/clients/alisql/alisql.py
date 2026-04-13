@@ -3,11 +3,30 @@ from contextlib import contextmanager
 
 import mysql.connector as mysql
 import numpy as np
+from mysql.connector.cursor import MySQLCursorPrepared
 
 from ..api import VectorDB
 from .config import AliSQLConfigDict, AliSQLIndexConfig
 
 log = logging.getLogger(__name__)
+
+
+class _NoResetPreparedCursor(MySQLCursorPrepared):
+    """MySQLCursorPrepared that skips the unnecessary COM_STMT_RESET.
+
+    mysql-connector-python sends COM_STMT_RESET before every COM_STMT_EXECUTE,
+    adding a full network round-trip per query. This is safe to skip when
+    results are always fully consumed via fetchall().
+    """
+
+    def execute(self, operation, params=None, **kwargs):
+        conn = self._connection
+        real_reset = conn.cmd_stmt_reset
+        conn.cmd_stmt_reset = lambda *a, **kw: None
+        try:
+            return super().execute(operation, params, **kwargs)
+        finally:
+            conn.cmd_stmt_reset = real_reset
 
 
 class AliSQL(VectorDB):
@@ -38,15 +57,18 @@ class AliSQL(VectorDB):
         self.cursor = None
         self.conn = None
 
-    def _create_connection(self):
+    def _create_connection(self, use_prepared=False):
         conn = mysql.connect(
             host=self.db_config["host"],
             user=self.db_config["user"],
             port=self.db_config["port"],
             password=self.db_config["password"],
-            buffered=True,
+            ssl_disabled=True,
         )
-        cursor = conn.cursor()
+        if use_prepared:
+            cursor = conn.cursor(cursor_class=_NoResetPreparedCursor)
+        else:
+            cursor = conn.cursor()
 
         assert conn is not None, "Connection is not initialized"
         assert cursor is not None, "Cursor is not initialized"
@@ -58,11 +80,8 @@ class AliSQL(VectorDB):
         assert self.cursor is not None, "Cursor is not initialized"
         log.info(f'{self.name} client drop db : {self.db_config["database"]}')
 
-        # flush tables before dropping database to avoid some locking issue
-        self.cursor.execute("FLUSH TABLES")
         self.cursor.execute(f'DROP DATABASE IF EXISTS {self.db_config["database"]}')
         self.cursor.execute("COMMIT")
-        self.cursor.execute("FLUSH TABLES")
 
     def _create_db_table(self, dim: int):
         assert self.conn is not None, "Connection is not initialized"
@@ -97,17 +116,20 @@ class AliSQL(VectorDB):
             >>> with self.init():
             >>>     self.insert_embeddings()
         """
-        self.conn, self.cursor = self._create_connection()
+        self.conn, self.cursor = self._create_connection(use_prepared=True)
 
         index_param = self.case_config.index_param()
         search_param = self.case_config.search_param()
 
-        self.cursor.execute("SET sql_mode = ''")
+        # Use a plain cursor for SET/COMMIT statements
+        plain_cursor = self.conn.cursor()
+        plain_cursor.execute("SET sql_mode = ''")
 
         if index_param["index_type"] == "HNSW":
             if search_param["ef_search"] is not None:
-                self.cursor.execute(f"SET SESSION vidx_hnsw_ef_search = {search_param['ef_search']}")
-            self.cursor.execute("COMMIT")
+                plain_cursor.execute(f"SET SESSION vidx_hnsw_ef_search = {search_param['ef_search']}")
+            plain_cursor.execute("COMMIT")
+        plain_cursor.close()
 
         self.insert_sql = (
             f'INSERT INTO {self.db_config["database"]}.{self.table_name} (id, v) VALUES (%s, %s)'  # noqa: S608
@@ -181,7 +203,6 @@ class AliSQL(VectorDB):
 
             self.cursor.executemany(self.insert_sql, batch_data)
             self.cursor.execute("COMMIT")
-            self.cursor.execute("FLUSH TABLES")
 
             return len(metadata), None
         except Exception as e:
